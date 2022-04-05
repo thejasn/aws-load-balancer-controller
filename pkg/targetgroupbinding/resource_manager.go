@@ -40,9 +40,11 @@ type ResourceManager interface {
 // NewDefaultResourceManager constructs new defaultResourceManager.
 func NewDefaultResourceManager(k8sClient client.Client, elbv2Client services.ELBV2, ec2Client services.EC2,
 	podInfoRepo k8s.PodInfoRepo, sgManager networking.SecurityGroupManager, sgReconciler networking.SecurityGroupReconciler,
-	vpcID string, clusterName string, eventRecorder record.EventRecorder, logger logr.Logger, useEndpointSlices bool, disabledRestrictedSGRulesFlag bool, vpcInfoProvider networking.VPCInfoProvider) *defaultResourceManager {
+	vpcInfoProvider networking.VPCInfoProvider,
+	vpcID string, clusterName string, failOpenEnabled bool, endpointSliceEnabled bool, disabledRestrictedSGRulesFlag bool,
+	eventRecorder record.EventRecorder, logger logr.Logger) *defaultResourceManager {
 	targetsManager := NewCachedTargetsManager(elbv2Client, logger)
-	endpointResolver := backend.NewDefaultEndpointResolver(k8sClient, podInfoRepo, logger)
+	endpointResolver := backend.NewDefaultEndpointResolver(k8sClient, podInfoRepo, failOpenEnabled, endpointSliceEnabled, logger)
 
 	nodeInfoProvider := networking.NewDefaultNodeInfoProvider(ec2Client, logger)
 	podENIResolver := networking.NewDefaultPodENIInfoResolver(k8sClient, ec2Client, nodeInfoProvider, vpcID, logger)
@@ -58,9 +60,9 @@ func NewDefaultResourceManager(k8sClient client.Client, elbv2Client services.ELB
 		logger:            logger,
 		vpcID:             vpcID,
 		vpcInfoProvider:   vpcInfoProvider,
+		podInfoRepo:       podInfoRepo,
 
 		targetHealthRequeueDuration: defaultTargetHealthRequeueDuration,
-		enableEndpointSlices:        useEndpointSlices,
 	}
 }
 
@@ -75,10 +77,10 @@ type defaultResourceManager struct {
 	eventRecorder     record.EventRecorder
 	logger            logr.Logger
 	vpcInfoProvider   networking.VPCInfoProvider
+	podInfoRepo       k8s.PodInfoRepo
 	vpcID             string
 
 	targetHealthRequeueDuration time.Duration
-	enableEndpointSlices        bool
 }
 
 func (m *defaultResourceManager) Reconcile(ctx context.Context, tgb *elbv2api.TargetGroupBinding) error {
@@ -98,6 +100,9 @@ func (m *defaultResourceManager) Cleanup(ctx context.Context, tgb *elbv2api.Targ
 	if err := m.networkingManager.Cleanup(ctx, tgb); err != nil {
 		return err
 	}
+	if err := m.updatePodAsHealthyForDeletedTGB(ctx, tgb); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -108,16 +113,13 @@ func (m *defaultResourceManager) reconcileWithIPTargetType(ctx context.Context, 
 	resolveOpts := []backend.EndpointResolveOption{
 		backend.WithPodReadinessGate(targetHealthCondType),
 	}
+
 	var endpoints []backend.PodEndpoint
 	var containsPotentialReadyEndpoints bool
 	var err error
 
-	// Decide whether to use Endpoints or EndpointSlices based on config flag
-	if m.enableEndpointSlices {
-		endpoints, containsPotentialReadyEndpoints, err = m.endpointResolver.ResolvePodEndpointsFromSlices(ctx, svcKey, tgb.Spec.ServiceRef.Port, resolveOpts...)
-	} else {
-		endpoints, containsPotentialReadyEndpoints, err = m.endpointResolver.ResolvePodEndpoints(ctx, svcKey, tgb.Spec.ServiceRef.Port, resolveOpts...)
-	}
+	endpoints, containsPotentialReadyEndpoints, err = m.endpointResolver.ResolvePodEndpoints(ctx, svcKey, tgb.Spec.ServiceRef.Port, resolveOpts...)
+
 	if err != nil {
 		if errors.Is(err, backend.ErrNotFound) {
 			m.eventRecorder.Event(tgb, corev1.EventTypeWarning, k8s.TargetGroupBindingEventReasonBackendNotFound, err.Error())
@@ -326,6 +328,34 @@ func (m *defaultResourceManager) updateTargetHealthPodConditionForPod(ctx contex
 	}
 
 	return needFurtherProbe, nil
+}
+
+// updatePodAsHealthyForDeletedTGB updates pod's targetHealth condition as healthy when deleting a TGB
+// if the pod has readiness Gate.
+func (m *defaultResourceManager) updatePodAsHealthyForDeletedTGB(ctx context.Context, tgb *elbv2api.TargetGroupBinding) error {
+	targetHealthCondType := BuildTargetHealthPodConditionType(tgb)
+
+	allPodKeys := m.podInfoRepo.ListKeys(ctx)
+	for _, podKey := range allPodKeys {
+		pod, exists, err := m.podInfoRepo.Get(ctx, podKey)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return errors.New("couldn't find podInfo for ready endpoint")
+		}
+		if pod.HasAnyOfReadinessGates([]corev1.PodConditionType{targetHealthCondType}) {
+			targetHealth := &elbv2sdk.TargetHealth{
+				State:       awssdk.String(elbv2sdk.TargetHealthStateEnumHealthy),
+				Description: awssdk.String("Target Group Binding is deleted"),
+			}
+			_, err := m.updateTargetHealthPodConditionForPod(ctx, pod, targetHealth, targetHealthCondType)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (m *defaultResourceManager) deregisterTargets(ctx context.Context, tgARN string, targets []TargetInfo) error {
